@@ -1,0 +1,137 @@
+// ========================================
+// 0. Parc National de Ranomafana
+// ========================================
+var ranomafana = ee.FeatureCollection("WCMC/WDPA/current/polygons")
+  .filter(ee.Filter.eq("NAME", "Ranomafana"));
+var bufferZone = ranomafana.map(function(f){ return f.buffer(10000); });
+var region = bufferZone.union().geometry();
+
+// ========================================
+// 1. Indicateurs de végétation
+// ========================================
+// NDVI annuel (2023)
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(region).filterDate("2023-01-01", "2023-12-31")
+  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20)).median();
+var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// EVI (2022)
+var evi = ee.ImageCollection("MODIS/006/MOD13Q1")
+  .filterDate("2022-01-01", "2022-12-31").select('EVI').mean().rename('EVI');
+
+// LAI (2022)
+var lai = ee.ImageCollection("MODIS/006/MCD15A3H")
+  .filterDate("2022-01-01", "2022-12-31").select("Lai").mean().rename("LAI");
+
+// FAPAR
+var fapar = ee.ImageCollection("MODIS/006/MCD15A3H")
+  .filterDate("2022-01-01", "2022-12-31").select("Fpar").mean().rename("FAPAR");
+
+// Canopy cover (2000)
+var canopy = ee.Image("UMD/hansen/global_forest_change_2022_v1_10").select('treecover2000').rename('Canopy_2000');
+
+// ========================================
+// 2. Pression, fragmentation et feu
+// ========================================
+// Perte 2022
+var lossYear = ee.Image("UMD/hansen/global_forest_change_2022_v1_10").select('lossyear');
+var loss2022 = lossYear.eq(22).selfMask().rename("Loss2022");
+
+// Fragmentation (lisière forêt 2000)
+var forest2000 = canopy.gt(30);
+var fragmentation = forest2000.focal_max(150, 'circle', 'meters').subtract(forest2000).rename("Fragmentation");
+
+// Fréquence des feux (2022)
+var fireMask = ee.ImageCollection("MODIS/061/MOD14A1")
+  .filterDate('2022-01-01', '2022-12-31')
+  .select("FireMask").map(function(img){ return img.gt(6); });
+var fireFreq = fireMask.sum().rename('FireFrequency');
+
+// ========================================
+// 3. Climat et stress hydrique
+// ========================================
+var chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+  .filterBounds(region).filterDate('2022-01-01', '2022-12-31');
+var precip2022 = chirps.sum().rename("Precipitation_2022");
+
+var temp = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE")
+  .filterBounds(region).filterDate("2022-01-01", "2022-12-31")
+  .select("tmmx").mean().rename("MaxTemp_2022");
+
+// ========================================
+// 4. Agriculture et occupation du sol
+// ========================================
+var landcover = ee.ImageCollection("ESA/WorldCover/v100")
+  .first().select('Map').rename('LandCover'); // 10 m LC
+
+// ========================================
+// 5. Indicateurs socio-économiques spatialisés
+// ========================================
+// Population (2020)
+var population = ee.Image("WorldPop/GP/100m/pop/MDG_2020").rename('Pop_2020');
+
+// Lumières nocturnes (2022)
+var lights = ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG")
+  .filterDate("2022-01-01", "2022-12-31")
+  .select("avg_rad").mean().rename("NightLights");
+
+// ========================================
+// Grille 1 km² et classification des zones
+// ========================================
+var grid = ee.Image.random().multiply(1e6).toInt();
+var grid1km = grid.reduceToVectors({
+  geometry: region, scale: 1000, geometryType: 'polygon',
+  bestEffort: true, maxPixels: 1e13, tileScale: 8
+});
+
+var classifiedGrid = grid1km.map(function(f){
+  var insidePark = ranomafana.geometry().intersects(f.geometry(), ee.ErrorMargin(10));
+  var inBuffer = bufferZone.geometry().intersects(f.geometry(), ee.ErrorMargin(10));
+  var zoneType = ee.Number(
+    ee.Algorithms.If(insidePark, 1, ee.Algorithms.If(inBuffer, 2, 3))
+  );
+  return f.set('zone_type', zoneType);
+});
+
+// ========================================
+// Combinaison des indicateurs
+// ========================================
+var combined = ndvi
+  .addBands(evi)
+  .addBands(lai)
+  .addBands(fapar)
+  .addBands(canopy)
+  .addBands(loss2022)
+  .addBands(fragmentation)
+  .addBands(fireFreq)
+  .addBands(precip2022)
+  .addBands(temp)
+  .addBands(landcover)
+  .addBands(population)
+  .addBands(lights);
+
+// ========================================
+// Analyse zonale 1 km²
+// ========================================
+var zonalStats = combined.reduceRegions({
+  collection: classifiedGrid,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+});
+
+// ========================================
+// Exports
+// ========================================
+// 1. Export CSV avec indicateurs
+Export.table.toDrive({
+  collection: zonalStats,
+  description: 'Ranomafana_Indicateurs_Comparatifs',
+  fileFormat: 'CSV'
+});
+
+// 2. Export shapefile de la grille classée
+Export.table.toDrive({
+  collection: classifiedGrid,
+  description: 'Grille_Ranomafana_LandSharingSparing',
+  fileFormat: 'SHP'
+});
